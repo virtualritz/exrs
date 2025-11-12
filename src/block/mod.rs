@@ -24,7 +24,7 @@ use crate::{
     compression::ByteVec,
     error::{usize_to_i32, Error, Result, UnitResult},
     math::Vec2,
-    meta::{attribute::ChannelList, header::Header, BlockDescription, Headers, MetaData},
+    meta::{attribute::{ChannelList, IntegerBounds}, header::Header, BlockDescription, Headers, MetaData},
 };
 use std::io::{Read, Seek, Write};
 
@@ -178,7 +178,18 @@ impl UncompressedBlock {
 
         let header: &Header = headers.get(index.layer).expect("block layer index bug");
 
-        let expected_byte_size = header.channels.bytes_per_pixel * self.index.pixel_size.area(); // TODO sampling??
+        let tile_coordinates = TileCoordinates {
+            // FIXME this calculation should not be made here but elsewhere instead (in
+            // meta::header?)
+            tile_index: index.pixel_position / header.max_block_pixel_size(),
+            level_index: index.level,
+        };
+
+        let absolute_indices = header.get_absolute_block_pixel_coordinates(tile_coordinates)?;
+        absolute_indices.validate(Some(header.layer_size))?;
+
+        // Calculate expected byte size accounting for channel subsampling
+        let expected_byte_size = header.channels.bytes_per_pixel_section(absolute_indices);
         if expected_byte_size != data.len() {
             panic!(
                 "get_line byte size should be {} but was {}",
@@ -186,16 +197,6 @@ impl UncompressedBlock {
                 data.len()
             );
         }
-
-        let tile_coordinates = TileCoordinates {
-            // FIXME this calculation should not be made here but elsewhere instead (in
-            // meta::header?)
-            tile_index: index.pixel_position / header.max_block_pixel_size(), // TODO sampling??
-            level_index: index.level,
-        };
-
-        let absolute_indices = header.get_absolute_block_pixel_coordinates(tile_coordinates)?;
-        absolute_indices.validate(Some(header.layer_size))?;
 
         if !header.compression.may_loose_data() {
             debug_assert_eq!(
@@ -278,12 +279,16 @@ impl UncompressedBlock {
         block_index: BlockIndex,
         mut extract_line: impl FnMut(LineRefMut<'_>),
     ) -> Vec<u8> {
-        let byte_count = block_index.pixel_size.area() * channels.bytes_per_pixel;
+        // Calculate byte count accounting for channel subsampling
+        let pixel_bounds = IntegerBounds {
+            position: block_index.pixel_position.to_i32(),
+            size: block_index.pixel_size,
+        };
+        let byte_count = channels.bytes_per_pixel_section(pixel_bounds);
         let mut block_bytes = vec![0_u8; byte_count];
 
         for (byte_range, line_index) in LineIndex::lines_in_block(block_index, channels) {
             extract_line(LineRefMut {
-                // TODO subsampling
                 value: &mut block_bytes[byte_range],
                 location: line_index,
             });

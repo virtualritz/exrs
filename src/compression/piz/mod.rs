@@ -38,7 +38,7 @@ pub fn decompress(
     let expected_u16_count = expected_byte_size / 2;
     debug_assert_eq!(
         expected_byte_size,
-        rectangle.size.area() * channels.bytes_per_pixel
+        channels.bytes_per_pixel_section(rectangle)
     );
     debug_assert!(!channels.list.is_empty());
 
