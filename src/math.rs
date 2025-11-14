@@ -261,7 +261,7 @@ impl RoundingMode {
 ///
 /// # Examples
 /// ```
-/// # use exrs::math::div_p;
+/// # use exr::math::div_p;
 /// assert_eq!(div_p(5, 2), 2);    // 5 / 2 = 2.5 -> 2
 /// assert_eq!(div_p(-3, 2), -2);  // -3 / 2 = -1.5 -> -2
 /// assert_eq!(div_p(4, 2), 2);    // 4 / 2 = 2 -> 2
@@ -285,7 +285,7 @@ pub fn div_p(x: i32, s: usize) -> i32 {
 ///
 /// # Examples
 /// ```
-/// # use exrs::math::mod_p;
+/// # use exr::math::mod_p;
 /// assert_eq!(mod_p(5, 2), 1);   // 5 % 2 = 1
 /// assert_eq!(mod_p(-3, 2), 1);  // -3 % 2 = 1 (not -1!)
 /// assert_eq!(mod_p(4, 2), 0);   // 4 % 2 = 0
@@ -311,7 +311,7 @@ pub fn mod_p(x: i32, s: usize) -> usize {
 ///
 /// # Examples
 /// ```
-/// # use exrs::math::num_samples;
+/// # use exr::math::num_samples;
 /// // Sampling rate 2, interval [1, 5] -> samples at [2, 4]
 /// assert_eq!(num_samples(2, 1, 5), 2);
 /// // Sampling rate 2, interval [2, 6] -> samples at [2, 4, 6]

@@ -242,7 +242,7 @@ impl<S: ReadSamplesLevel> ReadSamples for ReadAllLevels<S> {
                     header,
                     channel,
                     Vec2(0, 0),
-                    data_size,
+                    header.layer_size,
                 )?)
             }
         };

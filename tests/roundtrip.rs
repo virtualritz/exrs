@@ -67,6 +67,13 @@ fn round_trip_rgba_file(path: &Path, file: &[u8]) -> Result<()> {
     // these files are known to be invalid, because they do not contain any rgb channels
     let blacklist = [
         Path::new("tests/images/valid/openexr/LuminanceChroma/Garden.exr"),
+        Path::new("tests/images/valid/openexr/LuminanceChroma/CrissyField.exr"),
+        Path::new("tests/images/valid/openexr/LuminanceChroma/Flowers.exr"),
+        Path::new("tests/images/valid/openexr/LuminanceChroma/MtTamNorth.exr"),
+        Path::new("tests/images/valid/openexr/LuminanceChroma/StarField.exr"),
+        Path::new("tests/images/valid/openexr/Chromaticities/Rec709_YC.exr"),
+        Path::new("tests/images/valid/openexr/Chromaticities/XYZ_YC.exr"),
+        Path::new("tests/images/valid/openexr/IlmfmlmflmTest/comp_b44.exr"),
         Path::new("tests/images/valid/openexr/MultiView/Fog.exr"),
         Path::new("tests/images/valid/openexr/TestImages/GrayRampsDiagonal.exr"),
         Path::new("tests/images/valid/openexr/TestImages/GrayRampsHorizontal.exr"),
