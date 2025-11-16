@@ -9,6 +9,7 @@ mod rle;
 mod piz;
 mod pxr24;
 mod b44;
+mod htj2k;
 
 
 use std::convert::TryInto;
@@ -134,13 +135,29 @@ pub enum Compression {
     // than DWAA_COMPRESSION.
     DWAB(Option<f32>), // TODO collapse with DWAA. default Compression Level setting is 45.0
 
-    /// __This lossy compression is not yet supported by this implementation.__
-    // High-Throughput JPEG 2000 (32 lines)
-    HTJ2K32,
+    /// High-Throughput JPEG 2000 lossy compression (32 scan line blocks).
+    /// Provides lossy compression with quality control and resolution scalability.
+    ///
+    /// The optional f32 parameter is the quality factor (QStep).
+    /// Higher values = more compression, lower quality.
+    /// Should be larger than 1/2^(sample depth) according to the HTJ2K spec.
+    /// If None, a default quality is used.
+    ///
+    /// __Note:__ Requires the `htj2k` feature flag (adds C dependencies via jpeg2k crate).
+    /// When the feature is not enabled, attempting to use this compression will return an error.
+    HTJ2K32(Option<f32>),
 
-    /// __This lossy compression is not yet supported by this implementation.__
-    // High-Throughput JPEG 2000 (256 lines)
-    HTJ2K256,
+    /// High-Throughput JPEG 2000 lossy compression (256 scan line blocks).
+    /// More efficient for full-frame decoding than HTJ2K32.
+    ///
+    /// The optional f32 parameter is the quality factor (QStep).
+    /// Higher values = more compression, lower quality.
+    /// Should be larger than 1/2^(sample depth) according to the HTJ2K spec.
+    /// If None, a default quality is used.
+    ///
+    /// __Note:__ Requires the `htj2k` feature flag (adds C dependencies via jpeg2k crate).
+    /// When the feature is not enabled, attempting to use this compression will return an error.
+    HTJ2K256(Option<f32>),
 }
 
 impl std::fmt::Display for Compression {
@@ -156,8 +173,8 @@ impl std::fmt::Display for Compression {
             Compression::DWAB(_) => "dwab",
             Compression::PIZ => "piz",
             Compression::PXR24 => "pxr24",
-            Compression::HTJ2K32 => "ht j2k 32",
-            Compression::HTJ2K256 => "ht j2k 256",
+            Compression::HTJ2K32(_) => "htj2k 32",
+            Compression::HTJ2K256(_) => "htj2k 256",
         })
     }
 }
@@ -189,6 +206,8 @@ impl Compression {
             PXR24 => pxr24::compress(&header.channels, uncompressed_native_endian.clone(), pixel_section),
             B44 => b44::compress(&header.channels, uncompressed_native_endian.clone(), pixel_section, false),
             B44A => b44::compress(&header.channels, uncompressed_native_endian.clone(), pixel_section, true),
+            HTJ2K32(quality) => htj2k::compress(&header.channels, uncompressed_native_endian.clone(), pixel_section, quality),
+            HTJ2K256(quality) => htj2k::compress(&header.channels, uncompressed_native_endian.clone(), pixel_section, quality),
             _ => return Err(Error::unsupported(format!("yet unimplemented compression method: {}", self)))
         };
 
@@ -230,6 +249,7 @@ impl Compression {
                 PIZ => piz::decompress(&header.channels, compressed_le, pixel_section, expected_byte_size, pedantic),
                 PXR24 => pxr24::decompress(&header.channels, compressed_le, pixel_section, expected_byte_size, pedantic),
                 B44 | B44A => b44::decompress(&header.channels, compressed_le, pixel_section, expected_byte_size, pedantic),
+                HTJ2K32(_) | HTJ2K256(_) => htj2k::decompress(&header.channels, compressed_le, pixel_section, expected_byte_size, pedantic, None),
                 _ => return Err(Error::unsupported(format!("yet unimplemented compression method: {}", self)))
             };
 
@@ -259,10 +279,10 @@ impl Compression {
     pub fn scan_lines_per_block(self) -> usize {
         use self::Compression::*;
         match self {
-            Uncompressed | RLE     | ZIP1              => 1,
-            ZIP16   | PXR24                            => 16,
-            PIZ     | B44   | B44A | DWAA(_) | HTJ2K32 => 32,
-            DWAB(_) | HTJ2K256                         => 256,
+            Uncompressed | RLE     | ZIP1                    => 1,
+            ZIP16   | PXR24                                  => 16,
+            PIZ     | B44   | B44A | DWAA(_) | HTJ2K32(_)   => 32,
+            DWAB(_) | HTJ2K256(_)                            => 256,
         }
     }
 
@@ -274,7 +294,7 @@ impl Compression {
                 true,
 
             ZIP16 | PXR24 | PIZ | B44 | B44A |
-            DWAA(_) | DWAB(_) | HTJ2K256 | HTJ2K32 =>
+            DWAA(_) | DWAB(_) | HTJ2K256(_) | HTJ2K32(_) =>
                 false,
         }
     }
@@ -286,7 +306,8 @@ impl Compression {
         match self {
             PXR24 => sample_type != SampleType::F32, // pxr reduces f32 to f24
             B44 | B44A => sample_type != SampleType::F16, // b44 only compresses f16 values, others are left uncompressed
-            Uncompressed | RLE | ZIP1 | ZIP16 | PIZ | HTJ2K32 | HTJ2K256 => true,
+            HTJ2K32(_) | HTJ2K256(_) => false, // htj2k is lossy compression
+            Uncompressed | RLE | ZIP1 | ZIP16 | PIZ => true,
             DWAB(_) | DWAA(_) => false,
         }
     }
@@ -296,8 +317,8 @@ impl Compression {
     pub fn may_loose_data(self) -> bool {
         use self::Compression::*;
         match self {
-            Uncompressed | RLE | ZIP1 | ZIP16 | PIZ | HTJ2K32 | HTJ2K256 => false,
-            PXR24 | B44 | B44A | DWAB(_) | DWAA(_) => true,
+            Uncompressed | RLE | ZIP1 | ZIP16 | PIZ => false,
+            PXR24 | B44 | B44A | DWAB(_) | DWAA(_) | HTJ2K32(_) | HTJ2K256(_) => true,
         }
     }
 
@@ -309,7 +330,7 @@ impl Compression {
         use self::Compression::*;
         match self {
             B44A | DWAB(_) | DWAA(_) => false,
-            Uncompressed | PXR24 | RLE | ZIP1 | ZIP16 | PIZ | B44 | HTJ2K32 | HTJ2K256 => true,
+            Uncompressed | PXR24 | RLE | ZIP1 | ZIP16 | PIZ | B44 | HTJ2K32(_) | HTJ2K256(_) => true,
         }
     }
 
@@ -320,7 +341,7 @@ impl Compression {
         use self::Compression::*;
         match self {
             B44A | PXR24 | DWAB(_) | DWAA(_) => false,
-            B44 | Uncompressed | RLE | ZIP1 | ZIP16 | PIZ | HTJ2K32 | HTJ2K256 => true
+            B44 | Uncompressed | RLE | ZIP1 | ZIP16 | PIZ | HTJ2K32(_) | HTJ2K256(_) => true
         }
     }
 
