@@ -13,3 +13,4 @@ pngs/
 
 # ignore Cargo.lock since this is package
 Cargo.lock
+generated_rgba_with_meta.exr
