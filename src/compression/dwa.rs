@@ -17,8 +17,10 @@ mod classifier;
 mod constants;
 mod csc;
 mod dct;
+mod lut;
 mod nonlinear;
 mod rle;
+mod zip;
 
 use crate::compression::ByteVec;
 use crate::error::{Error, Result};
