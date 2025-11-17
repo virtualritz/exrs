@@ -67,14 +67,39 @@ fn convert_half_to_linear(x: u16) -> u16 {
 }
 
 /// Initialize the B44 lookup tables on first use.
-/// This generates 128KB of lookup tables (2 tables × 64K entries × 2 bytes).
+/// This generates 256KB of lookup tables (2 tables × 64K entries × 2 bytes).
+/// When rayon is enabled, table generation is parallelized for faster initialization.
 fn init_b44_tables() -> B44Tables {
     let mut exp_table = Box::new([0u16; 65536]);
     let mut log_table = Box::new([0u16; 65536]);
 
-    for i in 0..65536 {
-        exp_table[i] = convert_half_from_linear(i as u16);
-        log_table[i] = convert_half_to_linear(i as u16);
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+
+        // Parallelize table generation for faster initialization
+        // Each table is generated in parallel using rayon's parallel iterators
+        exp_table.par_chunks_mut(1024).enumerate().for_each(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * 1024;
+            for (i, v) in chunk.iter_mut().enumerate() {
+                *v = convert_half_from_linear((base_idx + i) as u16);
+            }
+        });
+
+        log_table.par_chunks_mut(1024).enumerate().for_each(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * 1024;
+            for (i, v) in chunk.iter_mut().enumerate() {
+                *v = convert_half_to_linear((base_idx + i) as u16);
+            }
+        });
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    {
+        for i in 0..65536 {
+            exp_table[i] = convert_half_from_linear(i as u16);
+            log_table[i] = convert_half_to_linear(i as u16);
+        }
     }
 
     B44Tables {
