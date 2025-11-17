@@ -103,9 +103,10 @@ pub fn decompress(
     let dc_data = if header.dc_compressed_size > 0 {
         let compressed = read_bytes(&mut reader, header.dc_compressed_size)?;
         // DC coefficients are u16 values, decompress and apply byte-delta decoding
-        let decompressed = decompress_zip(&compressed, header.dc_uncompressed_size * 2)?;
-        // TODO: Apply byte-delta decoding (zip_reconstruct_bytes from OpenEXR)
-        decompressed
+        let mut scratch = decompress_zip(&compressed, header.dc_uncompressed_size * 2)?;
+        let mut reconstructed = vec![0u8; scratch.len()];
+        zip::zip_reconstruct_bytes(&mut reconstructed, &mut scratch);
+        reconstructed
     } else {
         Vec::new()
     };
@@ -393,6 +394,17 @@ fn write_channel_to_output(
     use crate::meta::attribute::SampleType;
     use half::f16;
 
+    // TODO: CRITICAL BUG - This function writes channels sequentially (planar),
+    // but EXR expects pixel-interleaved format!
+    //
+    // Current: [A0, A1, ..., B0, B1, ..., G0, G1, ..., R0, R1, ...]
+    // Expected: [A0, B0, G0, R0, A1, B1, G1, R1, ...]
+    //
+    // This causes all pixels to read as 0.0 because we write to channel offsets,
+    // but the reader expects pixel*channels_per_pixel offsets.
+    //
+    // Fix requires rewriting to process row-by-row with proper interleaving.
+
     match sample_type {
         SampleType::F16 => {
             // Convert to f16 with inverse nonlinear transform
@@ -401,9 +413,6 @@ fn write_channel_to_output(
             }
 
             for (i, &value) in spatial_data.iter().enumerate() {
-                // Spatial data from inverse DCT is in quantized (nonlinear) space as f32
-                // We need to convert to f16, then apply inverse nonlinear (toLinear) lookup
-                // to get back to linear light values
                 let quantized_f16 = f16::from_f32(value);
                 let linear = nonlinear_lut.lookup(quantized_f16);
 
@@ -412,7 +421,6 @@ fn write_channel_to_output(
                               i, value, quantized_f16.to_bits(), quantized_f16.to_f32(), linear);
                 }
 
-                // Convert linear value to f16 and write as little-endian bytes
                 let half = f16::from_f32(linear);
                 let bytes = half.to_le_bytes();
                 output[i * 2] = bytes[0];
