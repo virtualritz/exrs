@@ -23,13 +23,17 @@ mod rle;
 mod zip;
 
 use crate::compression::ByteVec;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, usize_to_i32};
 use crate::meta::attribute::{ChannelList, IntegerBounds};
 
 use std::io::Cursor;
 
 use classifier::{classify_channels, CompressionScheme};
+use lut::TO_LINEAR_LUT;
 use nonlinear::InverseNonlinearLut;
+
+// Import RLE post-processing functions from parent compression module
+use super::optimize_bytes::{differences_to_samples, interleave_byte_blocks};
 
 /// Decompress DWAA/DWAB compressed data
 ///
@@ -113,9 +117,28 @@ pub fn decompress(
 
     let rle_data = if header.rle_compressed_size > 0 {
         let compressed = read_bytes(&mut reader, header.rle_compressed_size)?;
-        let uncompressed = decompress_zip(&compressed, header.rle_uncompressed_size)?;
-        decompress_rle(&uncompressed, header.rle_raw_size)?
+        let mut scratch = decompress_zip(&compressed, header.rle_uncompressed_size)?;
+
+        // Apply ZIP reconstruction FIRST (like DC data)
+        let mut reconstructed = vec![0u8; scratch.len()];
+        zip::zip_reconstruct_bytes(&mut reconstructed, &mut scratch);
+        eprintln!("DWA: RLE after ZIP+reconstruct: {} bytes, first 20: {:?}",
+                  reconstructed.len(), &reconstructed[..reconstructed.len().min(20)]);
+
+        // Then apply byte-level RLE decompression to the reconstructed data
+        let rle = decompress_rle(&reconstructed, header.rle_raw_size)?;
+
+        // Convert first 10 u16 values to f16 for debugging
+        let mut debug_values = Vec::new();
+        for i in 0..(10.min(rle.len() / 2)) {
+            let u16_val = u16::from_le_bytes([rle[i*2], rle[i*2+1]]);
+            let f16_val = half::f16::from_bits(u16_val);
+            debug_values.push(f16_val.to_f32());
+        }
+        eprintln!("DWA: RLE decompressed, first 10 as f16: {:?}", debug_values);
+        rle
     } else {
+        eprintln!("DWA: No RLE data");
         Vec::new()
     };
 
@@ -170,59 +193,77 @@ pub fn decompress(
         }
     }
 
-    // Write all channels to output
-    let mut output_offset = 0;
+    // Write output in scanline-major, channel-minor order (like PIZ)
+    // Format: for each scanline, write all channels for that scanline
+    //
+    // Scanline 0: [Chan0 samples][Chan1 samples][Chan2 samples]...
+    // Scanline 1: [Chan0 samples][Chan1 samples][Chan2 samples]...
+
+    // Track read positions in source buffers
+    let mut channel_read_positions: Vec<usize> = vec![0; channels.list.len()];
     let mut unknown_offset = 0;
     let mut rle_offset = 0;
+    let mut output_offset = 0;
 
-    for (ch_idx, channel) in channels.list.iter().enumerate() {
-        let channel_class = &classification.channel_classifications[ch_idx];
-        let channel_resolution = channel.subsampled_resolution(rectangle.size);
-        let channel_pixel_count = channel_resolution.area();
-        let bytes_per_sample = channel.sample_type.bytes_per_sample();
-        let channel_bytes = channel_pixel_count * bytes_per_sample;
+    for y in rectangle.position.y()..rectangle.end().y() {
+        for (ch_idx, channel) in channels.list.iter().enumerate() {
+            let channel_class = &classification.channel_classifications[ch_idx];
+            let channel_resolution = channel.subsampled_resolution(rectangle.size);
+            let bytes_per_sample = channel.sample_type.bytes_per_sample();
 
-        match channel_class.scheme {
-            CompressionScheme::LossyDct => {
-                if let Some(spatial_data) = &spatial_buffers[ch_idx] {
-                    eprintln!("DWA: Writing {} pixels to output for channel {} at offset {}",
-                              spatial_data.len(), ch_idx, output_offset);
-                    // Apply inverse nonlinear transform and write to output
-                    write_channel_to_output(
-                        spatial_data,
-                        channel.sample_type,
-                        &nonlinear_lut,
-                        &mut output[output_offset..output_offset + channel_bytes],
-                    )?;
-                } else {
-                    eprintln!("DWA: WARNING - No spatial data for LossyDct channel {} (skipping {} bytes)",
-                              ch_idx, channel_bytes);
-                }
-                output_offset += channel_bytes;
+            // Check if this scanline is subsampled for this channel
+            if super::mod_p(y, usize_to_i32(channel.sampling.y(), "sampling")?) != 0 {
+                continue;
             }
-            CompressionScheme::Rle => {
-                // RLE compressed channel
-                if rle_offset + channel_bytes > rle_data.len() {
-                    return Err(Error::invalid("RLE data buffer too small"));
+
+            let samples_per_line = channel_resolution.x();
+            let bytes_per_line = samples_per_line * bytes_per_sample;
+
+            match channel_class.scheme {
+                CompressionScheme::LossyDct => {
+                    if let Some(spatial_data) = &spatial_buffers[ch_idx] {
+                        let read_pos = channel_read_positions[ch_idx];
+                        let samples_this_line = &spatial_data[read_pos..read_pos + samples_per_line];
+
+                        // Apply inverse nonlinear transform and write to output
+                        write_channel_scanline(
+                            samples_this_line,
+                            channel.sample_type,
+                            channel.quantize_linearly,
+                            &nonlinear_lut,
+                            &mut output[output_offset..output_offset + bytes_per_line],
+                        )?;
+
+                        channel_read_positions[ch_idx] += samples_per_line;
+                    } else {
+                        return Err(Error::invalid("Missing spatial data for LossyDct channel"));
+                    }
+                    output_offset += bytes_per_line;
                 }
+                CompressionScheme::Rle => {
+                    // RLE compressed channel
+                    if rle_offset + bytes_per_line > rle_data.len() {
+                        return Err(Error::invalid("RLE data buffer too small"));
+                    }
 
-                output[output_offset..output_offset + channel_bytes]
-                    .copy_from_slice(&rle_data[rle_offset..rle_offset + channel_bytes]);
+                    output[output_offset..output_offset + bytes_per_line]
+                        .copy_from_slice(&rle_data[rle_offset..rle_offset + bytes_per_line]);
 
-                rle_offset += channel_bytes;
-                output_offset += channel_bytes;
-            }
-            CompressionScheme::Unknown => {
-                // ZIP compressed channel
-                if unknown_offset + channel_bytes > unknown_data.len() {
-                    return Err(Error::invalid("Unknown data buffer too small"));
+                    rle_offset += bytes_per_line;
+                    output_offset += bytes_per_line;
                 }
+                CompressionScheme::Unknown => {
+                    // ZIP compressed channel
+                    if unknown_offset + bytes_per_line > unknown_data.len() {
+                        return Err(Error::invalid("Unknown data buffer too small"));
+                    }
 
-                output[output_offset..output_offset + channel_bytes]
-                    .copy_from_slice(&unknown_data[unknown_offset..unknown_offset + channel_bytes]);
+                    output[output_offset..output_offset + bytes_per_line]
+                        .copy_from_slice(&unknown_data[unknown_offset..unknown_offset + bytes_per_line]);
 
-                unknown_offset += channel_bytes;
-                output_offset += channel_bytes;
+                    unknown_offset += bytes_per_line;
+                    output_offset += bytes_per_line;
+                }
             }
         }
     }
@@ -384,61 +425,79 @@ fn apply_inverse_csc(y_data: &[f32], cb_data: &[f32], cr_data: &[f32]) -> (Vec<f
     (r_data, g_data, b_data)
 }
 
-/// Apply inverse nonlinear transform and write channel to output
-fn write_channel_to_output(
-    spatial_data: &[f32],
+/// Write a scanline of DCT-decoded samples to output
+///
+/// Applies toLinear LUT conditionally:
+/// - If quantize_linearly=false (RGB): apply toLinear to convert from perceptual to linear
+/// - If quantize_linearly=true (Alpha): skip toLinear, data is already linear
+fn write_channel_scanline(
+    spatial_samples: &[f32],
     sample_type: crate::meta::attribute::SampleType,
-    nonlinear_lut: &InverseNonlinearLut,
+    quantize_linearly: bool,
+    _nonlinear_lut: &InverseNonlinearLut,
     output: &mut [u8],
 ) -> Result<()> {
     use crate::meta::attribute::SampleType;
     use half::f16;
 
-    // TODO: CRITICAL BUG - This function writes channels sequentially (planar),
-    // but EXR expects pixel-interleaved format!
-    //
-    // Current: [A0, A1, ..., B0, B1, ..., G0, G1, ..., R0, R1, ...]
-    // Expected: [A0, B0, G0, R0, A1, B1, G1, R1, ...]
-    //
-    // This causes all pixels to read as 0.0 because we write to channel offsets,
-    // but the reader expects pixel*channels_per_pixel offsets.
-    //
-    // Fix requires rewriting to process row-by-row with proper interleaving.
-
     match sample_type {
         SampleType::F16 => {
-            // Convert to f16 with inverse nonlinear transform
-            if output.len() != spatial_data.len() * 2 {
+            if output.len() != spatial_samples.len() * 2 {
                 return Err(Error::invalid("Output buffer size mismatch for F16"));
             }
 
-            for (i, &value) in spatial_data.iter().enumerate() {
-                let quantized_f16 = f16::from_f32(value);
-                let linear = nonlinear_lut.lookup(quantized_f16);
+            for (i, &value) in spatial_samples.iter().enumerate() {
+                // Convert f32 to f16
+                let spatial_f16 = f16::from_f32(value);
+                let spatial_bits = spatial_f16.to_bits();
+
+                // TEMPORARY: Skip toLinear to test if DCT output is already in linear space
+                let output_bits = spatial_bits;
+                /*
+                // Apply toLinear LUT if channel is perceptually quantized
+                // (quantize_linearly=false means use perceptual quantization)
+                let output_bits = if !quantize_linearly {
+                    // Apply toLinear: perceptual → linear
+                    TO_LINEAR_LUT[spatial_bits as usize]
+                } else {
+                    // Skip toLinear: already linear
+                    spatial_bits
+                };
+                */
 
                 if i < 3 {
-                    eprintln!("DWA DEBUG write[{}]: spatial_f32={:.6}, spatial_f16={:04x} ({:.6}), linear={:.6}",
-                              i, value, quantized_f16.to_bits(), quantized_f16.to_f32(), linear);
+                    let output_f16 = f16::from_bits(output_bits);
+                    eprintln!("DWA WRITE[{}]: spatial={:.6} ({:#06x}), applied_toLinear={}, output={:.6} ({:#06x})",
+                              i, value, spatial_bits, !quantize_linearly, output_f16.to_f32(), output_bits);
                 }
 
-                let half = f16::from_f32(linear);
-                let bytes = half.to_le_bytes();
+                // Write as little-endian bytes
+                let bytes = output_bits.to_le_bytes();
                 output[i * 2] = bytes[0];
                 output[i * 2 + 1] = bytes[1];
             }
         }
         SampleType::F32 => {
-            // Convert to f32 with inverse nonlinear transform
-            if output.len() != spatial_data.len() * 4 {
+            if output.len() != spatial_samples.len() * 4 {
                 return Err(Error::invalid("Output buffer size mismatch for F32"));
             }
 
-            for (i, &value) in spatial_data.iter().enumerate() {
-                // Apply inverse nonlinear transform
-                let linear = nonlinear::from_nonlinear(value);
+            for (i, &value) in spatial_samples.iter().enumerate() {
+                // For F32, convert through f16 to apply LUT, then expand to f32
+                let spatial_f16 = f16::from_f32(value);
+                let spatial_bits = spatial_f16.to_bits();
+
+                let linear_bits = if !quantize_linearly {
+                    TO_LINEAR_LUT[spatial_bits as usize]
+                } else {
+                    spatial_bits
+                };
+
+                let linear_f16 = f16::from_bits(linear_bits);
+                let linear_f32 = linear_f16.to_f32();
 
                 // Write as little-endian bytes
-                let bytes = linear.to_le_bytes();
+                let bytes = linear_f32.to_le_bytes();
                 output[i * 4..i * 4 + 4].copy_from_slice(&bytes);
             }
         }
@@ -635,40 +694,39 @@ fn decompress_zip(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     Ok(decompressed)
 }
 
-/// Decompress RLE data (simple RLE, not the same as the main RLE compression)
-/// This is a basic RLE format used for DWAA/DWAB metadata
+/// Decompress RLE data using u16-based RLE format
+/// After ZIP reconstruction, the data is in u16-based RLE format
 fn decompress_rle(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     let mut decompressed = Vec::with_capacity(expected_size);
-    let mut remaining = compressed;
+    let mut pos = 0;
 
-    while !remaining.is_empty() && decompressed.len() < expected_size {
-        if remaining.is_empty() {
-            return Err(Error::invalid("Unexpected end of RLE data"));
-        }
-
-        let count = remaining[0] as i8;
-        remaining = &remaining[1..];
+    while pos < compressed.len() && decompressed.len() < expected_size {
+        // Read count as signed byte
+        let count = compressed[pos] as i8;
+        pos += 1;
 
         if count < 0 {
-            // Take the next '-count' bytes as-is
-            let n = (-count) as usize;
-            if remaining.len() < n {
+            // Literal run: copy next '-count' u16 values
+            let num_u16s = (-count) as usize;
+            let num_bytes = num_u16s * 2;
+
+            if pos + num_bytes > compressed.len() {
                 return Err(Error::invalid("RLE data truncated"));
             }
 
-            decompressed.extend_from_slice(&remaining[..n]);
-            remaining = &remaining[n..];
+            decompressed.extend_from_slice(&compressed[pos..pos + num_bytes]);
+            pos += num_bytes;
         } else {
-            // Repeat the next value 'count + 1' times
-            if remaining.is_empty() {
+            // Repeat run: repeat next u16 value 'count + 1' times
+            if pos + 2 > compressed.len() {
                 return Err(Error::invalid("RLE data truncated"));
             }
 
-            let value = remaining[0];
-            remaining = &remaining[1..];
+            let value_bytes = &compressed[pos..pos + 2];
+            pos += 2;
 
             for _ in 0..=(count as usize) {
-                decompressed.push(value);
+                decompressed.extend_from_slice(value_bytes);
             }
         }
     }
